@@ -6,9 +6,11 @@
 #include <Functions/GatherUtils/Algorithms.h>
 #include <Functions/GatherUtils/Sinks.h>
 #include <Functions/GatherUtils/Sources.h>
+#include <Functions/GatherUtils/Slices.h>
 #include <Functions/IFunction.h>
 #include <Functions/formatString.h>
 #include <IO/WriteHelpers.h>
+#include <IO/SharedThreadPools.h>
 #include <base/map.h>
 #include <IO/ConnectionTimeouts.h>
 #include <IO/ReadWriteBufferFromHTTP.h>
@@ -89,33 +91,72 @@ public:
 
         auto result = ColumnString::create();
 
+        auto runner = threadPoolCallbackRunner<void>(getIOThreadPool().get(), "FunctionFetch");
+        std::vector<std::future<void>> futures;
+        std::vector<std::string> bufs(source.rowNum());
+        int i = 0;
         while (!source.isEnd())
         {
-            auto slice = source.getWhole();
-            std::string url(reinterpret_cast<const char *>(slice.data), slice.size);
+            bufs.resize(i+1);
 
-            try
-            {
-                Poco::URI uri(url);
-                Poco::Net::HTTPBasicCredentials credentials{};
-                auto buf = BuilderRWBufferFromHTTP(uri)
-                            .withConnectionGroup(HTTPConnectionGroupType::STORAGE)
-                            .withMethod(Poco::Net::HTTPRequest::HTTP_GET)
-                            .withTimeouts(ConnectionTimeouts::getHTTPTimeouts(
-                                    getContext()->getSettingsRef(),
-                                    getContext()->getServerSettings().keep_alive_timeout))
-                            .create(credentials);
-  
-                std::string response;
-                readStringUntilEOF(response, *buf);
-                result->insertData(response.data(), response.size());
-            }
-            catch (...)
-            {
-                result->insertData("", 0);
-            }
+            auto sourceSlice = source.getWhole();
+            futures.push_back(runner(
+                [&, slice = std::move(sourceSlice), index = i, bufsArr = &bufs]()
+                {
+                    std::string url(reinterpret_cast<const char *>(slice.data), slice.size);
 
+                    try
+                    {
+                        Poco::URI uri(url);
+                        Poco::Net::HTTPBasicCredentials credentials{};
+                        auto settings = getContext()->getReadSettings();
+                        settings.http_max_tries = 0;
+                        auto timeouts = ConnectionTimeouts::getHTTPTimeouts(
+                                            getContext()->getSettingsRef(),
+                                            getContext()->getServerSettings().keep_alive_timeout);
+                        timeouts.connection_timeout = Poco::Timespan(1, 0);
+                        timeouts.send_timeout = Poco::Timespan(1, 0);
+                        timeouts.receive_timeout = Poco::Timespan(3, 0);
+
+
+                        auto buf = BuilderRWBufferFromHTTP(uri)
+                                    .withConnectionGroup(HTTPConnectionGroupType::STORAGE)
+                                    .withMethod(Poco::Net::HTTPRequest::HTTP_GET)
+                                    .withSettings(settings)
+                                    .withTimeouts(timeouts)
+                                    .create(credentials);
+        
+                        std::string response;
+                        readStringUntilEOF(response, *buf);
+                        bufsArr->at(index) = response;
+                    }
+                    catch (...)
+                    {
+                       bufsArr->at(index) = "";
+                    }
+
+            }, Priority{0}));
+            i ++;
             source.next();
+        }
+
+        try {
+            for (auto & future : futures)
+                future.wait();
+
+            for (auto & future : futures)
+                future.get();
+
+            futures.clear();
+        } catch (...) {
+            for (auto & future: futures)
+            if (future.valid())
+                future.wait();
+            throw;
+        }
+
+        for(auto buf : bufs) {
+            result->insertData(buf.data(), buf.size());
         }
 
         return result;
